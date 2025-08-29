@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  server:
+    build: .
+    container_name: server
+    volumes:
+      - ./logs:/app/logs
+    command: python server.py
+    ports:
+      - "65432:65432"
+
+  client1:
+    build: .
+    container_name: client1
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      CLIENT_ID: 1
+    command: python client.py --client-id 1
+    depends_on:
+      - server
+
+  client2:
+    build: .
+    container_name: client2
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      CLIENT_ID: 2
+    command: python client.py
+    depends_on:
+      - server
