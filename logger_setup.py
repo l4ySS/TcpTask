@@ -15,3 +15,4 @@ def create_logger(name: str, filename: str):
 
 def log_line(logger: logging.Logger, line: str):
     logger.info(line)
+

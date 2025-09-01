@@ -18,7 +18,6 @@ client_counter = 0
 response_counter = 0
 response_lock = asyncio.Lock()
 
-
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     global client_counter, response_counter
 
