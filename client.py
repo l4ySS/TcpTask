@@ -1,92 +1,155 @@
 import asyncio
+import re
 import os
-from random import randrange
-from datetime import datetime
 from zoneinfo import ZoneInfo
+from random import randrange
+from datetime import datetime, timedelta
 from logger_setup import create_logger, log_line
 
 HOST = "server"
 PORT = 65432
-TIMEOUT = 2.0
-PAUSE_BETWEEN_PINGS_RANGE_MS = (300, 3000)
-RUN_DURATION_SECONDS = 300
+SESSION_DURATION = 5 * 60  # 5 минут
+REQUEST_TIMEOUT = 2
+PING_INTERVAL_MS = (300, 3000)  # задержка между пингами в миллисекундах
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 client_id = int(os.getenv("CLIENT_ID", 1))
 logger = create_logger("client_logger", f"logs/client{client_id}_log.csv")
 
-def log_client(request_text="", response_text="", time_request=None, time_response=None, keepalive=False):
-    date_str = (time_request or time_response).strftime("%Y-%m-%d")
-    time_req_str = time_request.strftime("%H:%M:%S.%f")[:-3] if time_request else ""
-    time_res_str = time_response.strftime("%H:%M:%S.%f")[:-3] if time_response else ""
+pending_requests: dict[int, dict] = {}
+pending_requests_lock = asyncio.Lock()
 
-    if keepalive:
-        log_line(logger, f"{date_str};;;{time_res_str};{response_text}")
+KEEPALIVE_PATTERN = re.compile(r'^\[(\d+)\]\s*keepalive$', re.IGNORECASE)
+PONG_PATTERN = re.compile(
+    r'^\[(\d+)\s*/\s*(\d+)\]\s*PONG\s*\(\s*(\d+)\s*\)$',
+    re.IGNORECASE
+)
+
+def write_log(
+    request: str = "",
+    response: str = "",
+    sent_at: datetime = None,
+    received_at: datetime = None,
+    is_keepalive: bool = False
+):
+    timestamp = (sent_at or received_at) or datetime.now(MOSCOW_TZ)
+    date_str = timestamp.strftime("%Y-%m-%d")
+    sent_str = sent_at.strftime("%H:%M:%S.%f")[:-3] if sent_at else ""
+    recv_str = received_at.strftime("%H:%M:%S.%f")[:-3] if received_at else ""
+
+    if is_keepalive:
+        log_line(logger, f"{date_str};;;{recv_str};{response}")
     else:
-        log_line(logger, f"{date_str};{time_req_str};{request_text};{time_res_str};{response_text}")
+        log_line(logger, f"{date_str};{sent_str};{request};{recv_str};{response}")
 
 
-async def send_and_wait(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request_id: int):
-    message = f"[{request_id}] PING"
-    time_request = datetime.now(MOSCOW_TZ)
-    writer.write((message + "\n").encode("ascii"))
-    await writer.drain()
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + TIMEOUT
-    while True:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            log_client(request_text=message,
-                       response_text="(таймаут)",
-                       time_request=time_request,
-                       time_response=datetime.now(MOSCOW_TZ))
-            return
-
-        try:
-            data = await asyncio.wait_for(reader.readline(), timeout=remaining)
-        except asyncio.TimeoutError:
-            log_client(request_text=message,
-                       response_text="(таймаут)",
-                       time_request=time_request,
-                       time_response=datetime.now(MOSCOW_TZ))
-            return
-
-        response_text = data.decode("ascii").strip()
-        time_response = datetime.now(MOSCOW_TZ)
-
-        if "keepalive" in response_text.lower():
-            log_client(response_text=response_text,
-                       time_response=time_response,
-                       keepalive=True)
-            continue
-
-        log_client(request_text=message,
-                   response_text=response_text,
-                   time_request=time_request,
-                   time_response=time_response)
-        return
-
-
-async def stop_after(duration):
-    await asyncio.sleep(duration)
-
-async def main():
-    reader, writer = await asyncio.open_connection(HOST, PORT)
+async def send_ping(writer: asyncio.StreamWriter):
+    """Периодически отправляет PING на сервер."""
+    request_id = 0
     try:
-        req_id = 0
-        timer_task = asyncio.create_task(stop_after(RUN_DURATION_SECONDS))
         while True:
+            message = f"[{request_id}] PING"
+            now = datetime.now(MOSCOW_TZ)
+            async with pending_requests_lock:
+                pending_requests[request_id] = {"text": message, "time": now}
 
-            if timer_task.done():
-                break
+            writer.write((message + "\n").encode("ascii"))
+            await writer.drain()
 
-            await send_and_wait(reader, writer, req_id)
-            await asyncio.sleep(randrange(*PAUSE_BETWEEN_PINGS_RANGE_MS) * 0.001)
-            req_id += 1
+            await asyncio.sleep(randrange(*PING_INTERVAL_MS) * 0.001)
+            request_id += 1
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+async def read_responses(reader: asyncio.StreamReader):
+    """Читает ответы от сервера и логирует их."""
+    while True:
+        data = await reader.readline()
+        if not data:
+            print("Сервер закрыл соединение")
+            break
+
+        try:
+            response = data.decode("ascii").strip()
+        except UnicodeDecodeError:
+            continue
+
+        received_at = datetime.now(MOSCOW_TZ)
+
+        if KEEPALIVE_PATTERN.match(response):
+            write_log(response=response, received_at=received_at, is_keepalive=True)
+            continue
+
+        pong_match = PONG_PATTERN.match(response)
+        if pong_match:
+            resp_id, req_id = int(pong_match.group(1)), int(pong_match.group(2))
+            async with pending_requests_lock:
+                request = pending_requests.pop(req_id, None)
+
+            if request:
+                write_log(
+                    request=request["text"],
+                    response=response,
+                    sent_at=request["time"],
+                    received_at=received_at
+                )
+            continue
+
+
+async def monitor_timeouts():
+    """Проверяет таймауты запросов."""
+    while True:
+        await asyncio.sleep(0.1)
+        now = datetime.now(MOSCOW_TZ)
+        expired = []
+
+        async with pending_requests_lock:
+            for req_id, req in list(pending_requests.items()):
+                if (now - req["time"]).total_seconds() > REQUEST_TIMEOUT:
+                    expired.append((req_id, req))
+                    pending_requests.pop(req_id, None)
+
+        for _, req in expired:
+            timeout_at = req["time"] + timedelta(seconds=REQUEST_TIMEOUT)
+            write_log(
+                request=req["text"],
+                response="(таймаут)",
+                sent_at=req["time"],
+                received_at=timeout_at
+            )
+
+
+async def shutdown_after(duration: int, tasks: list[asyncio.Task]):
+    """Через duration секунд завершает все задачи"""
+    await asyncio.sleep(duration)
+    for t in tasks:
+        t.cancel()
+
+
+async def main():
+    reader, writer = await asyncio.open_connection(HOST, PORT)
+
+    tasks = [
+        asyncio.create_task(send_ping(writer)),
+        asyncio.create_task(read_responses(reader)),
+        asyncio.create_task(monitor_timeouts())
+    ]
+    killer_task = asyncio.create_task(shutdown_after(SESSION_DURATION, tasks))
+
+    results = await asyncio.gather(*tasks, killer_task, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+            print("Ошибка:", r)
+
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     asyncio.run(main())
