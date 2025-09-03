@@ -15,7 +15,7 @@ services:
       - ./logs:/app/logs
     environment:
       CLIENT_ID: 1
-    command: python client.py --client-id 1
+    command: python client.py
     depends_on:
       - server
 
